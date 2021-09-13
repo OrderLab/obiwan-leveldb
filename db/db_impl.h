@@ -18,6 +18,9 @@
 #include "port/port.h"
 #include "port/thread_annotations.h"
 
+#include "orbit.h"
+#include <queue>
+
 namespace leveldb {
 
 class MemTable;
@@ -26,7 +29,7 @@ class Version;
 class VersionEdit;
 class VersionSet;
 
-class DBImpl : public DB {
+class DBImpl : public DB, public orbit::global_new_operator {
  public:
   DBImpl(const Options& options, const std::string& dbname);
 
@@ -116,7 +119,7 @@ class DBImpl : public DB {
   void MaybeIgnoreError(Status* s) const;
 
   // Delete any unneeded files and stale in-memory entries.
-  void RemoveObsoleteFiles() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  void RemoveObsoleteFiles(orbit_scratch *scratch = nullptr) EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   // Compact the in-memory write buffer to disk.  Switches to a new
   // log-file/memtable and writes a new descriptor iff successful.
@@ -136,15 +139,24 @@ class DBImpl : public DB {
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   void RecordBackgroundError(const Status& s);
+  void RecordBackgroundError_orbit(const Status& s, orbit_scratch *scratch);
 
   void MaybeScheduleCompaction() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  static void ob_bgwait(void *);
+
   static void BGWork(void* db);
+  static unsigned long BGWork_orbit(void *store, void* db);
+
   void BackgroundCall();
-  void BackgroundCompaction() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  // void BackgroundCompaction() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  void BackgroundCompaction_orbit(orbit_scratch *scratch);
+      /* RK: We do not need EXCLUSIVE_LOCKS_REQUIRED(mutex_) for orbit. */
   void CleanupCompaction(CompactionState* compact)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
   Status DoCompactionWork(CompactionState* compact)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
+  static unsigned long obop_addstats(size_t argc, unsigned long argv[]);
 
   Status OpenCompactionOutputFile(CompactionState* compact);
   Status FinishCompactionOutputFile(CompactionState* compact, Iterator* input);
@@ -165,7 +177,11 @@ class DBImpl : public DB {
   const std::string dbname_;
 
   // table_cache_ provides its own synchronization
-  TableCache* const table_cache_;
+  TableCache* table_cache_;
+  // TableCache* const table_cache_;
+  // RK: note that currently we are recreating the table cache in the
+  // orbit, so we need to modify this pointer value, and thus have to drop
+  // the const qualifier.
 
   // Lock over the persistent DB state.  Non-null iff successfully acquired.
   FileLock* db_lock_;
@@ -198,6 +214,18 @@ class DBImpl : public DB {
   ManualCompaction* manual_compaction_ GUARDED_BY(mutex_);
 
   VersionSet* const versions_ GUARDED_BY(mutex_);
+
+  struct orbit_waiter_queue {
+    port::Mutex qmu_;
+    port::CondVar qcv_ GUARDED_BY(qmu_);
+    std::queue<orbit_task> queue_ GUARDED_BY(qmu_);
+
+    orbit_waiter_queue();
+    void push(orbit_task task);
+    /* Returns true when a task is popped, 0 if the system is shutting down. */
+    bool pop(orbit_task *task, const std::atomic<bool> &shutting_down);
+  };
+  orbit_waiter_queue *ob_bgwait_queue_ GUARDED_BY(mutex_);
 
   // Have we encountered a background error in paranoid mode?
   Status bg_error_ GUARDED_BY(mutex_);

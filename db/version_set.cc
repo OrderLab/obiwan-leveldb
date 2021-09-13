@@ -19,6 +19,8 @@
 #include "util/coding.h"
 #include "util/logging.h"
 
+#include "orbit.h"
+
 namespace leveldb {
 
 static size_t TargetFileSize(const Options* options) {
@@ -774,7 +776,26 @@ void VersionSet::AppendVersion(Version* v) {
   v->next_->prev_ = v;
 }
 
+/* FIXME: Change this logic to apply to the main program */
+void VersionSet::AppendVersion_orbit(Version* v, orbit_scratch *scratch) {
+  // Make "v" current
+  assert(v->refs_ == 0);
+  assert(v != current_);
+  if (current_ != nullptr) {
+    current_->Unref();
+  }
+  current_ = v;
+  v->Ref();
+
+  // Append to linked list
+  v->prev_ = dummy_versions_.prev_;
+  v->next_ = &dummy_versions_;
+  v->prev_->next_ = v;
+  v->next_->prev_ = v;
+}
+
 Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
+  assert_not_orbit_context();
   if (edit->has_log_number_) {
     assert(edit->log_number_ >= log_number_);
     assert(edit->log_number_ < next_file_number_);
@@ -854,6 +875,109 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
       descriptor_file_ = nullptr;
       env_->RemoveFile(new_manifest_file);
     }
+  }
+
+  return s;
+}
+
+Status VersionSet::LogAndApply_orbit(VersionEdit* edit, orbit_scratch *scratch) {
+  assert_orbit_context();
+  if (edit->has_log_number_) {
+    assert(edit->log_number_ >= log_number_);
+    assert(edit->log_number_ < next_file_number_);
+  } else {
+    edit->SetLogNumber(log_number_);
+  }
+
+  if (!edit->has_prev_log_number_) {
+    edit->SetPrevLogNumber(prev_log_number_);
+  }
+
+  edit->SetNextFile(next_file_number_);
+  edit->SetLastSequence(last_sequence_);
+
+  Version* v = new Version(this);
+  {
+    Builder builder(this, current_);
+    // FIXME: how is the vset_->compact_pointer_ used in vset?
+    // Also need to move `new FileMetaData` to scratch.
+    builder.Apply(edit);
+    builder.SaveTo(v);
+  }
+  Finalize(v);
+
+  // Initialize new descriptor log file if necessary by creating
+  // a temporary file that contains a snapshot of the current version.
+  std::string new_manifest_file;
+  Status s;
+  // FIXME: the trickiest thing is this desc log append ...
+  // The expected behavior is that this won't have negative effect since
+  // main is not expected to modify this file anyway.
+  if (descriptor_log_ == nullptr) {
+    // No reason to unlock *mu here since we only hit this path in the
+    // first call to LogAndApply (when opening the database).
+    // TODO(orbit): If the above is true, then orbit prabably should never
+    // hit this path.
+    fprintf(stderr, "orbit: we should not really hit this path, should we?\n");
+    abort();
+    assert(descriptor_file_ == nullptr);
+    new_manifest_file = DescriptorFileName(dbname_, manifest_file_number_);
+    edit->SetNextFile(next_file_number_);
+    s = env_->NewWritableFile(new_manifest_file, &descriptor_file_);
+    if (s.ok()) {
+      descriptor_log_ = new log::Writer(descriptor_file_);
+      s = WriteSnapshot(descriptor_log_);
+    }
+  }
+
+  // Unlock during expensive MANIFEST log write
+  // ORBIT_SYNC_TAG
+  // mu->Unlock();
+
+  // Write new record to MANIFEST log
+  if (s.ok()) {
+    std::string record;
+    edit->EncodeTo(&record);
+    // orbit: we rely on log file to also (batch) update the pos in the desc file.
+    s = descriptor_log_->AddRecord(record, scratch);
+    if (s.ok()) {
+      s = descriptor_file_->Sync();
+    }
+    if (!s.ok()) {
+      Log(options_->info_log, "MANIFEST write: %s\n", s.ToString().c_str());
+    }
+  }
+
+  // FIXME: how will this affect the normal execution of main?
+  // If we just created a new descriptor file, install it by writing a
+  // new CURRENT file that points to it.
+  if (s.ok() && !new_manifest_file.empty()) {
+    s = SetCurrentFile(env_, dbname_, manifest_file_number_);
+  }
+
+  // ORBIT_SYNC_TAG
+  // mu->Lock();
+
+  // Install the new version
+  if (s.ok()) {
+    AppendVersion(v);
+    AppendVersion_orbit(v, scratch);
+    log_number_ = edit->log_number_;
+    orbit_scratch_push_update(scratch, &log_number_, sizeof(log_number_));
+    prev_log_number_ = edit->prev_log_number_;
+    orbit_scratch_push_update(scratch, &prev_log_number_, sizeof(prev_log_number_));
+  } else {
+    fprintf(stderr, "orbit: compaction has failed!\n");
+    delete v;
+    if (!new_manifest_file.empty()) {
+      delete descriptor_log_;
+      delete descriptor_file_;
+      descriptor_log_ = nullptr;
+      descriptor_file_ = nullptr;
+      env_->RemoveFile(new_manifest_file);
+    }
+    // TODO: ORBIT_ROLLBACK_TAG How should we recover from this scenario?
+    abort();
   }
 
   return s;
@@ -1440,6 +1564,7 @@ void VersionSet::SetupOtherInputs(Compaction* c) {
   // We update this immediately instead of waiting for the VersionEdit
   // to be applied so that if the compaction fails, we will try a different
   // key range next time.
+  // FIXME: send compact_pointer_ to main
   compact_pointer_[level] = largest.Encode().ToString();
   c->edit_.SetCompactPointer(level, largest);
 }
@@ -1559,6 +1684,7 @@ bool Compaction::ShouldStopBefore(const Slice& internal_key) {
 }
 
 void Compaction::ReleaseInputs() {
+  // TODO: port this unref logic
   if (input_version_ != nullptr) {
     input_version_->Unref();
     input_version_ = nullptr;

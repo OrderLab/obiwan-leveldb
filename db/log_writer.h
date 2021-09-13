@@ -11,13 +11,15 @@
 #include "leveldb/slice.h"
 #include "leveldb/status.h"
 
+#include "orbit.h"
+
 namespace leveldb {
 
 class WritableFile;
 
 namespace log {
 
-class Writer {
+class Writer : public orbit::global_new_operator {
  public:
   // Create a writer that will append data to "*dest".
   // "*dest" must be initially empty.
@@ -34,7 +36,7 @@ class Writer {
 
   ~Writer();
 
-  Status AddRecord(const Slice& slice);
+  Status AddRecord(const Slice& slice, orbit_scratch *orbit = nullptr);
 
  private:
   Status EmitPhysicalRecord(RecordType type, const char* ptr, size_t length);

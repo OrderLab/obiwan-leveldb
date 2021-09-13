@@ -31,7 +31,8 @@ Writer::Writer(WritableFile* dest, uint64_t dest_length)
 
 Writer::~Writer() = default;
 
-Status Writer::AddRecord(const Slice& slice) {
+Status Writer::AddRecord(const Slice& slice, orbit_scratch *scratch) {
+  assert(is_orbit_context() ^ (!scratch));
   const char* ptr = slice.data();
   size_t left = slice.size();
 
@@ -76,6 +77,11 @@ Status Writer::AddRecord(const Slice& slice) {
     left -= fragment_length;
     begin = false;
   } while (s.ok() && left > 0);
+  // TODO(orbit): ORBIT_ROLLBACK_TAG What to do if the `s` shows error?
+  // TODO: will we allocate new log and desc so we need to sanitize the pointers?
+  orbit_scratch_push_update(scratch, this, sizeof(*this));
+  dest_->push_orbit_update(scratch);
+  // TODO: error handling for above 2 push_update
   return s;
 }
 

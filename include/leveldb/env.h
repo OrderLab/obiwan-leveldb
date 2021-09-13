@@ -21,6 +21,30 @@
 #include "leveldb/export.h"
 #include "leveldb/status.h"
 
+#include "orbit.h"
+
+#if 1
+// TODO: check for existence of __builtin_expect
+#define __orbit_unlikely(x)     __builtin_expect((x),0)
+
+#define assert_orbit_context() do { \
+  if(__orbit_unlikely(!is_orbit_context())) { \
+    fprintf(stderr, "fatal: %s not in orbit context!\n", __func__); \
+    abort(); \
+  } \
+} while (0)
+
+#define assert_not_orbit_context() do { \
+  if(__orbit_unlikely(is_orbit_context())) { \
+    fprintf(stderr, "fatal: %s is in orbit context!\n", __func__); \
+    abort(); \
+  } \
+} while (0)
+#else
+#define assert_orbit_context() do { assert(is_orbit_context()); } while (0)
+#define assert_not_orbit_context() do { assert(!is_orbit_context()); } while (0)
+#endif
+
 // This workaround can be removed when leveldb::Env::DeleteFile is removed.
 #if defined(_WIN32)
 // On Windows, the method name DeleteFile (below) introduces the risk of
@@ -48,7 +72,7 @@ class SequentialFile;
 class Slice;
 class WritableFile;
 
-class LEVELDB_EXPORT Env {
+class LEVELDB_EXPORT Env : public orbit::global_new_operator {
  public:
   Env();
 
@@ -274,7 +298,7 @@ class LEVELDB_EXPORT RandomAccessFile {
 // A file abstraction for sequential writing.  The implementation
 // must provide buffering since callers may append small fragments
 // at a time to the file.
-class LEVELDB_EXPORT WritableFile {
+class LEVELDB_EXPORT WritableFile : public orbit::global_new_operator {
  public:
   WritableFile() = default;
 
@@ -287,6 +311,10 @@ class LEVELDB_EXPORT WritableFile {
   virtual Status Close() = 0;
   virtual Status Flush() = 0;
   virtual Status Sync() = 0;
+  virtual Status push_orbit_update(orbit_scratch *scratch) {
+    fprintf(stderr, "orbit not implemented for this env!\n");
+    abort();
+  }
 };
 
 // An interface for writing log messages.

@@ -24,6 +24,8 @@
 #include "port/port.h"
 #include "port/thread_annotations.h"
 
+#include "orbit.h"
+
 namespace leveldb {
 
 namespace log {
@@ -57,7 +59,7 @@ bool SomeFileOverlapsRange(const InternalKeyComparator& icmp,
                            const Slice* smallest_user_key,
                            const Slice* largest_user_key);
 
-class Version {
+class Version : public orbit::global_new_operator {
  public:
   // Lookup the value for key.  If found, store it in *val and
   // return OK.  Else return a non-OK status.  Fills *stats.
@@ -130,6 +132,23 @@ class Version {
         compaction_score_(-1),
         compaction_level_(-1) {}
 
+  struct orbit_copy_flag {};
+  // Copy constructor used only by the orbit.
+  // The second arg flag is used to prevent accidental copy.
+  Version(const Version& rhs, orbit_copy_flag)
+      : vset_(rhs.vset_),
+        refs_(rhs.refs_),
+        file_to_compact_(nullptr),
+        file_to_compact_level_(-1),
+        compaction_score_(rhs.compaction_score_),
+        compaction_level_(rhs.compaction_level_)
+  {
+    // New Version sent from orbit should just have those as init value.
+    assert(rhs.file_to_compact_ == nullptr);
+    assert(rhs.file_to_compact_level_ == -1);
+    // FIXME: add sanitization
+  }
+
   Version(const Version&) = delete;
   Version& operator=(const Version&) = delete;
 
@@ -151,6 +170,7 @@ class Version {
   int refs_;          // Number of live refs to this version
 
   // List of files per level
+  typedef std::vector<FileMetaData*, orbit::allocator<FileMetaData*>> Files;
   std::vector<FileMetaData*> files_[config::kNumLevels];
 
   // Next file to compact based on seek stats.
@@ -164,7 +184,7 @@ class Version {
   int compaction_level_;
 };
 
-class VersionSet {
+class VersionSet : public orbit::global_new_operator {
  public:
   VersionSet(const std::string& dbname, const Options* options,
              TableCache* table_cache, const InternalKeyComparator*);
@@ -180,6 +200,9 @@ class VersionSet {
   // REQUIRES: no other thread concurrently calls LogAndApply()
   Status LogAndApply(VersionEdit* edit, port::Mutex* mu)
       EXCLUSIVE_LOCKS_REQUIRED(mu);
+
+  Status LogAndApply_orbit(VersionEdit* edit, orbit_scratch *scratch);
+      /* RK: We don't need EXCLUSIVE_LOCKS_REQUIRED(mu); for orbit. */
 
   // Recover the last saved descriptor from persistent storage.
   Status Recover(bool* save_manifest);
@@ -292,6 +315,7 @@ class VersionSet {
   Status WriteSnapshot(log::Writer* log);
 
   void AppendVersion(Version* v);
+  void AppendVersion_orbit(Version* v, orbit_scratch *scratch);
 
   Env* const env_;
   const std::string dbname_;
@@ -357,6 +381,7 @@ class Compaction {
   // is successful.
   void ReleaseInputs();
 
+  orbit_scratch *&scratch() { return scratch_; }
  private:
   friend class Version;
   friend class VersionSet;
@@ -386,6 +411,8 @@ class Compaction {
   // higher level than the ones involved in this compaction (i.e. for
   // all L >= level_ + 2).
   size_t level_ptrs_[config::kNumLevels];
+
+  orbit_scratch *scratch_;
 };
 
 }  // namespace leveldb

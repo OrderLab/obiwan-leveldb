@@ -322,6 +322,13 @@ class PosixWritableFile final : public WritableFile {
     return SyncFd(fd_, filename_);
   }
 
+  Status push_orbit_update(orbit_scratch *scratch) override {
+    // TODO: will we allocate new log and desc so we need to sanitize the pointers?
+    orbit_scratch_push_update(scratch, this, sizeof(*this));
+    // TODO: error handling for push_update
+    return Status::OK();
+  }
+
  private:
   Status FlushBuffer() {
     Status status = WriteUnbuffered(buf_, pos_);
@@ -843,7 +850,7 @@ class SingletonEnv {
                   "env_storage_ will not fit the Env");
     static_assert(alignof(decltype(env_storage_)) >= alignof(EnvType),
                   "env_storage_ does not meet the Env's alignment needs");
-    new (&env_storage_) EnvType();
+    ::new (&env_storage_) EnvType();
   }
   ~SingletonEnv() = default;
 

@@ -35,6 +35,17 @@
 #include "util/logging.h"
 #include "util/mutexlock.h"
 
+#include "orbit.h"
+#include <limits>
+
+static struct orbit_pool *bgc_pool = orbit_pool_create(NULL, 64 * 1024 * 1024);
+static struct orbit_pool *bgc_reply_pool = orbit_pool_create(NULL, 64 * 1024 * 1024);
+static struct orbit_pool *bgc_scratch_pool = orbit_pool_create(NULL, 64 * 1024 * 1024);
+static struct orbit_allocator *bgc_alloc = orbit_allocator_from_pool(bgc_pool, true);
+
+int __init_orbit = (orbit::set_global_allocator(bgc_alloc),
+                    orbit_scratch_set_pool(bgc_scratch_pool));
+
 namespace leveldb {
 
 const int kNumNonTableCacheFiles = 10;
@@ -222,8 +233,10 @@ void DBImpl::MaybeIgnoreError(Status* s) const {
   }
 }
 
-void DBImpl::RemoveObsoleteFiles() {
-  mutex_.AssertHeld();
+void DBImpl::RemoveObsoleteFiles(orbit_scratch *scratch) {
+  assert(is_orbit_context() ^ (!scratch));
+  if (!is_orbit_context())
+    mutex_.AssertHeld();
 
   if (!bg_error_.ok()) {
     // After a background error, we don't know whether a new version may
@@ -272,6 +285,17 @@ void DBImpl::RemoveObsoleteFiles() {
         files_to_delete.push_back(std::move(filename));
         if (type == kTableFile) {
           table_cache_->Evict(number);
+          // We need to run this operation again in main program side because
+          // we initialized a new table_cache_ in orbit, which does not apply
+          // to the original one.
+          // TODO: If number does not exist in main's table_cache_, it should
+          // just be silent, right?
+          if (is_orbit_context()) {
+            DBImpl *thisptr = this;
+            orbit_scratch_run2(scratch, DBImpl*, thisptr, uint64_t, number, {
+              thisptr->table_cache_->Evict(number);
+            });
+          }
         }
         Log(options_.info_log, "Delete type=%d #%lld\n", static_cast<int>(type),
             static_cast<unsigned long long>(number));
@@ -282,11 +306,13 @@ void DBImpl::RemoveObsoleteFiles() {
   // While deleting all files unblock other threads. All files being deleted
   // have unique names which will not collide with newly created files and
   // are therefore safe to delete while allowing other threads to proceed.
-  mutex_.Unlock();
+  if (!is_orbit_context())
+    mutex_.Unlock();
   for (const std::string& filename : files_to_delete) {
     env_->RemoveFile(dbname_ + "/" + filename);
   }
-  mutex_.Lock();
+  if (!is_orbit_context())
+    mutex_.Lock();
 }
 
 Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
@@ -652,6 +678,7 @@ Status DBImpl::TEST_CompactMemTable() {
 }
 
 void DBImpl::RecordBackgroundError(const Status& s) {
+  assert_not_orbit_context();
   mutex_.AssertHeld();
   if (bg_error_.ok()) {
     bg_error_ = s;
@@ -659,7 +686,24 @@ void DBImpl::RecordBackgroundError(const Status& s) {
   }
 }
 
+// FIXME: Port `Status` to allow sending back with orbit
+void DBImpl::RecordBackgroundError_orbit(const Status& s, orbit_scratch *scratch) {
+  assert_orbit_context();
+  // mutex_.AssertHeld();
+  if (bg_error_.ok()) {
+    bg_error_ = s;
+    // background_work_finished_signal_.SignalAll();
+    DBImpl *thisptr = this;
+    orbit_scratch_run1(scratch, DBImpl*, thisptr, {
+      thisptr->background_work_finished_signal_.SignalAll();
+    });
+  }
+}
+
 void DBImpl::MaybeScheduleCompaction() {
+  assert_not_orbit_context();
+  // std::cerr << std::endl;
+  fprintf(stderr, "orbit: maybe schedule compaction\n");
   mutex_.AssertHeld();
   if (background_compaction_scheduled_) {
     // Already scheduled
@@ -671,8 +715,87 @@ void DBImpl::MaybeScheduleCompaction() {
              !versions_->NeedsCompaction()) {
     // No work to be done
   } else {
+    fprintf(stderr, "orbit: scheduling compaction\n");
     background_compaction_scheduled_ = true;
-    env_->Schedule(&DBImpl::BGWork, this);
+
+    struct orbit_module *ob = orbit_create("bgcompact", DBImpl::BGWork_orbit, NULL);
+
+    // env_->Schedule(&DBImpl::BGWork, this);
+    // TODO: the ideal way of manual integration for orbit_call will be adding
+    // an orbit API in Env.
+    struct orbit_task task;
+    DBImpl *thisptr = this;
+    int ret = orbit_call_async(ob, 0, 1, &bgc_pool, NULL, &thisptr, sizeof(thisptr), &task);
+    if (ret != 0) {
+      fprintf(stderr, "orbit: error making obcall!\n");
+      return;
+    }
+
+    if (ob_bgwait_queue_ == nullptr) {
+      ob_bgwait_queue_ = new orbit_waiter_queue();
+      env_->StartThread(DBImpl::ob_bgwait, this);
+    }
+    ob_bgwait_queue_->push(task);
+    fprintf(stderr, "orbit: task pushed!\n");
+  }
+}
+
+// TODO: add cleanup of this bg thread
+DBImpl::orbit_waiter_queue::orbit_waiter_queue() : qmu_(), qcv_(&qmu_), queue_() {}
+
+void DBImpl::orbit_waiter_queue::push(orbit_task task)
+{
+  qmu_.Lock();
+  if (queue_.empty())
+    qcv_.Signal();
+  queue_.push(task);
+  qmu_.Unlock();
+}
+
+bool DBImpl::orbit_waiter_queue::pop(orbit_task *task, const std::atomic<bool> &shutting_down)
+{
+  qmu_.Lock();
+  while (queue_.empty() && shutting_down.load(std::memory_order_acquire)) {
+    qcv_.Wait();
+  }
+  if (shutting_down.load(std::memory_order_acquire)) {
+    qmu_.Unlock();
+    return false;
+  }
+  assert(!queue_.empty());
+  *task = queue_.front();
+  queue_.pop();
+  qmu_.Unlock();
+  return true;
+}
+
+void DBImpl::ob_bgwait(void *db_)
+{
+  DBImpl *db = (DBImpl *)db_;
+  orbit_task task;
+  while (db->ob_bgwait_queue_->pop(&task, db->shutting_down_)) {
+    fprintf(stderr, "orbit: task popped!\n");
+
+    /* FIXME: Currently this is an ad hoc approach for LevelDB to receive
+     * compaction updates. */
+    orbit_result result_pool;
+    orbit_result result_updates;
+    orbit_result result_retval;
+    int ret;
+
+    ret = orbit_recvv(&result_pool, &task);
+    assert(ret == 1);
+    ret = orbit_recvv(&result_updates, &task);
+    assert(ret == 1);
+    ret = orbit_recvv(&result_retval, &task);
+    assert(ret == 0);
+    fprintf(stderr, "orbit: task received!\n");
+
+    db->mutex_.Lock();
+    orbit_type apply_res = orbit_apply(&result_updates.scratch, false);
+    assert(apply_res == ORBIT_END);
+    db->mutex_.Unlock();
+    fprintf(stderr, "orbit: scratch applied!\n");
   }
 }
 
@@ -680,37 +803,99 @@ void DBImpl::BGWork(void* db) {
   reinterpret_cast<DBImpl*>(db)->BackgroundCall();
 }
 
+unsigned long DBImpl::BGWork_orbit(void *store, void* db) {
+  assert_orbit_context();
+  (void)store;
+  (*reinterpret_cast<DBImpl**>(db))->BackgroundCall();
+  return 0;
+}
+
 void DBImpl::BackgroundCall() {
-  MutexLock l(&mutex_);
-  assert(background_compaction_scheduled_);
+  assert_orbit_context();
+  orbit_scratch scratch;
+  orbit_scratch_create(&scratch);
+
+  // FIXME: Do not create the alloc at the same place for the entire pool
+  // every time.
+  orbit_allocator *reply_alloc = orbit_allocator_from_pool(bgc_reply_pool, true);
+  assert(reply_alloc != nullptr);
+  // Change the global allocator in the orbit context so that we can
+  // transparently allocate all the objects that need to be sent back to the
+  // main program.
+  orbit::set_global_allocator(reply_alloc);
+
+  /* ORBIT_SYNC_TAG Orbit already have a snapshot of all the states, so
+   * we do not need to worry that we see inconsistent states without a lock in
+   * the orbit side.  But we do need to take care of state divergence, and how
+   * to merge these states later.  This will depend on semantics, and right now
+   * we do not have a systematic way of handling this, and we need to add
+   * app-specific logics. */
+  // MutexLock l(&mutex_);
+  // assert(background_compaction_scheduled_);
   if (shutting_down_.load(std::memory_order_acquire)) {
     // No more background work when shutting down.
+    /* FIXME: This check is not effective in orbit. */
   } else if (!bg_error_.ok()) {
     // No more background work after a background error.
   } else {
-    BackgroundCompaction();
+    // RK: Note that currently we are recreating the table cache so we do not
+    // need to copy the LRUCache, though this may or may not affect the performance.
+    // WARN: Note that the this TableCache may use option_.block_cache, which
+    // is a `Cache*` and it may cause problem due to incomplete porting.
+    table_cache_ = new TableCache(dbname_, options_, TableCacheSize(options_));
+    BackgroundCompaction_orbit(&scratch);
   }
 
   background_compaction_scheduled_ = false;
+  orbit_scratch_push_update(&scratch, &background_compaction_scheduled_,
+      sizeof(background_compaction_scheduled_));
 
   // Previous compaction may have produced too many files in a level,
   // so reschedule another compaction if needed.
-  MaybeScheduleCompaction();
-  background_work_finished_signal_.SignalAll();
+  // MaybeScheduleCompaction();
+  DBImpl *thisptr = this;
+  orbit_scratch_run1(&scratch, DBImpl*, thisptr, { thisptr->MaybeScheduleCompaction(); });
+
+  // background_work_finished_signal_.SignalAll();
+  orbit_scratch_run1(&scratch, DBImpl*, thisptr, {
+    thisptr->background_work_finished_signal_.SignalAll();
+  });
+
+  // TODO: This is a way to reuse the current scratch API to send pool ranges.
+  // We should instead directly have a pool range send API, and that would be
+  // much more flexible and ergonomic.
+  orbit_scratch reply_virtual_scratch;
+  reply_virtual_scratch.ptr = reply_alloc->start;
+  reply_virtual_scratch.size_limit = *reply_alloc->allocated;
+  int ret = orbit_sendv(&reply_virtual_scratch), err = errno;
+  if (ret != 0)
+    fprintf(stderr, "orbit_sendv reply returns error %d: %s\n", err, strerror(err));
+
+  ret = orbit_sendv(&scratch), err = errno;
+  if (ret != 0)
+    fprintf(stderr, "orbit_sendv scratch returns error %d: %s\n", err, strerror(err));
 }
 
-void DBImpl::BackgroundCompaction() {
-  mutex_.AssertHeld();
+void DBImpl::BackgroundCompaction_orbit(orbit_scratch *scratch) {
+  assert_orbit_context();
+  // ORBIT_SYNC_TAG
+  // mutex_.AssertHeld();
 
-  if (imm_ != nullptr) {
+  /* FIXME: we have not ported the skiplist yet.  A more severe issue is
+   * that we cannot handle multiple LogAndApply yet. */
+  /* if (imm_ != nullptr) {
     CompactMemTable();
     return;
-  }
+  } */
 
   Compaction* c;
   bool is_manual = (manual_compaction_ != nullptr);
   InternalKey manual_end;
   if (is_manual) {
+    /* BTW, allocation of manual_compaction_ needs to be moved from stack
+     * to orbit pool.*/
+    fprintf(stderr, "orbit: we should not enter this manual branch\n");
+    abort();
     ManualCompaction* m = manual_compaction_;
     c = versions_->CompactRange(m->level, m->begin, m->end);
     m->done = (c == nullptr);
@@ -726,6 +911,9 @@ void DBImpl::BackgroundCompaction() {
     c = versions_->PickCompaction();
   }
 
+  if (c != nullptr)
+    c->scratch() = scratch;
+
   Status status;
   if (c == nullptr) {
     // Nothing to do
@@ -736,9 +924,9 @@ void DBImpl::BackgroundCompaction() {
     c->edit()->RemoveFile(c->level(), f->number);
     c->edit()->AddFile(c->level() + 1, f->number, f->file_size, f->smallest,
                        f->largest);
-    status = versions_->LogAndApply(c->edit(), &mutex_);
+    status = versions_->LogAndApply_orbit(c->edit(), scratch);
     if (!status.ok()) {
-      RecordBackgroundError(status);
+      RecordBackgroundError_orbit(status, scratch);
     }
     VersionSet::LevelSummaryStorage tmp;
     Log(options_.info_log, "Moved #%lld to level-%d %lld bytes %s: %s\n",
@@ -749,7 +937,7 @@ void DBImpl::BackgroundCompaction() {
     CompactionState* compact = new CompactionState(c);
     status = DoCompactionWork(compact);
     if (!status.ok()) {
-      RecordBackgroundError(status);
+      RecordBackgroundError_orbit(status, scratch);
     }
     CleanupCompaction(compact);
     c->ReleaseInputs();
@@ -764,8 +952,16 @@ void DBImpl::BackgroundCompaction() {
   } else {
     Log(options_.info_log, "Compaction error: %s", status.ToString().c_str());
   }
+  /* RK: What are the possible bg_error_?  Technically we can rollback the
+   * operations by just not sending the scratch (only memory; file operations
+   * may complicate this idea).  If they are just temporary errors, we can
+   * keep the system functioning (instead of rejecting all operations with
+   * bg_error_).  Does this system handle rollback on error well, and can we
+   * bring additional add-on benefits? ORBIT_ROLLBACK_TAG */
 
   if (is_manual) {
+    fprintf(stderr, "orbit: we should not enter this manual branch\n");
+    abort();
     ManualCompaction* m = manual_compaction_;
     if (!status.ok()) {
       m->done = true;
@@ -781,7 +977,8 @@ void DBImpl::BackgroundCompaction() {
 }
 
 void DBImpl::CleanupCompaction(CompactionState* compact) {
-  mutex_.AssertHeld();
+  // ORBIT_SYNC_TAG
+  // mutex_.AssertHeld();
   if (compact->builder != nullptr) {
     // May happen if we get a shutdown call in the middle of compaction
     compact->builder->Abandon();
@@ -798,19 +995,25 @@ void DBImpl::CleanupCompaction(CompactionState* compact) {
 }
 
 Status DBImpl::OpenCompactionOutputFile(CompactionState* compact) {
+  assert_orbit_context();
   assert(compact != nullptr);
   assert(compact->builder == nullptr);
   uint64_t file_number;
   {
-    mutex_.Lock();
+    // ORBIT_SYNC_TAG
+    // mutex_.Lock();
+    // FIXME: add logic for the new file number part
     file_number = versions_->NewFileNumber();
     pending_outputs_.insert(file_number);
+    // FIXME: add differentiable allocation for InternalKey::rep_.
     CompactionState::Output out;
     out.number = file_number;
     out.smallest.Clear();
     out.largest.Clear();
+    // RK: this will cause a copy instead of move, should be optimized?
     compact->outputs.push_back(out);
-    mutex_.Unlock();
+    // ORBIT_SYNC_TAG
+    // mutex_.Unlock();
   }
 
   // Make the output file
@@ -824,6 +1027,7 @@ Status DBImpl::OpenCompactionOutputFile(CompactionState* compact) {
 
 Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
                                           Iterator* input) {
+  assert_orbit_context();
   assert(compact != nullptr);
   assert(compact->outfile != nullptr);
   assert(compact->builder != nullptr);
@@ -872,7 +1076,8 @@ Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
 }
 
 Status DBImpl::InstallCompactionResults(CompactionState* compact) {
-  mutex_.AssertHeld();
+  // ORBIT_SYNC_TAG
+  // mutex_.AssertHeld();
   Log(options_.info_log, "Compacted %d@%d + %d@%d files => %lld bytes",
       compact->compaction->num_input_files(0), compact->compaction->level(),
       compact->compaction->num_input_files(1), compact->compaction->level() + 1,
@@ -886,10 +1091,13 @@ Status DBImpl::InstallCompactionResults(CompactionState* compact) {
     compact->compaction->edit()->AddFile(level + 1, out.number, out.file_size,
                                          out.smallest, out.largest);
   }
-  return versions_->LogAndApply(compact->compaction->edit(), &mutex_);
+  return versions_->LogAndApply_orbit(compact->compaction->edit(), compact->compaction->scratch());
 }
 
 Status DBImpl::DoCompactionWork(CompactionState* compact) {
+  orbit_scratch *scratch = compact->compaction->scratch();
+
+  assert_orbit_context();
   const uint64_t start_micros = env_->NowMicros();
   int64_t imm_micros = 0;  // Micros spent doing imm_ compactions
 
@@ -909,8 +1117,8 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
 
   Iterator* input = versions_->MakeInputIterator(compact->compaction);
 
-  // Release mutex while we're actually doing the compaction work
-  mutex_.Unlock();
+  // ORBIT_SYNC_TAG
+  // mutex_.Unlock();
 
   input->SeekToFirst();
   Status status;
@@ -920,16 +1128,23 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   SequenceNumber last_sequence_for_key = kMaxSequenceNumber;
   while (input->Valid() && !shutting_down_.load(std::memory_order_acquire)) {
     // Prioritize immutable compaction work
-    if (has_imm_.load(std::memory_order_relaxed)) {
+    if (has_imm_.load(std::memory_order_relaxed)) { /*
       const uint64_t imm_start = env_->NowMicros();
+      ORBIT_SYNC_TAG
       mutex_.Lock();
       if (imm_ != nullptr) {
         CompactMemTable();
         // Wake up MakeRoomForWrite() if necessary.
         background_work_finished_signal_.SignalAll();
       }
+      // ORBIT_SYNC_TAG
       mutex_.Unlock();
       imm_micros += (env_->NowMicros() - imm_start);
+    */
+      /* FIXME: we need a way to do multiple compactions in one run.
+       * The current technical difficulty is that is that this task
+       * operates in the shared disk space. */
+      fprintf(stderr, "orbit: skipped imm table compaction!\n");
     }
 
     Slice key = input->key();
@@ -1036,18 +1251,41 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
     stats.bytes_written += compact->outputs[i].file_size;
   }
 
-  mutex_.Lock();
-  stats_[compact->compaction->level() + 1].Add(stats);
+  // ORBIT_SYNC_TAG
+  // mutex_.Lock();
+
+  // TODO: refactor the orbit operation API to make it more ergonomic even
+  // with manual porting.
+  unsigned long args[] = { (unsigned long)this,
+    (unsigned long)compact->compaction->level() + 1,
+    (unsigned long)stats.micros, (unsigned long)stats.bytes_read,
+    (unsigned long)stats.bytes_written, };
+  orbit_scratch_push_operation(scratch, &DBImpl::obop_addstats, 5, args);
+  // stats_[compact->compaction->level() + 1].Add(stats);
 
   if (status.ok()) {
     status = InstallCompactionResults(compact);
   }
   if (!status.ok()) {
-    RecordBackgroundError(status);
+    RecordBackgroundError_orbit(status, scratch);
   }
   VersionSet::LevelSummaryStorage tmp;
   Log(options_.info_log, "compacted to: %s", versions_->LevelSummary(&tmp));
   return status;
+}
+
+unsigned long DBImpl::obop_addstats(size_t argc, unsigned long argv[])
+{
+  assert(argc == 5);
+  DBImpl *db = (DBImpl*)argv[0];
+  size_t level = argv[1];
+  CompactionStats stats;
+  stats.micros = (int64_t)argv[2];
+  stats.bytes_read = (int64_t)argv[3];
+  stats.bytes_written = (int64_t)argv[4];
+
+  db->stats_[level].Add(stats);
+  return 0;
 }
 
 namespace {
