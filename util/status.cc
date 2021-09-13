@@ -8,12 +8,22 @@
 
 #include "port/port.h"
 
+#include "orbit.h"
+
 namespace leveldb {
 
 const char* Status::CopyState(const char* state) {
   uint32_t size;
   std::memcpy(&size, state, sizeof(size));
   char* result = new char[size + 5];
+  std::memcpy(result, state, size + 5);
+  return result;
+}
+
+const char* Status::CopyState_orbit(const char* state) {
+  uint32_t size;
+  std::memcpy(&size, state, sizeof(size));
+  char* result = (char*)orbit::global_new_operator::operator new(size);
   std::memcpy(result, state, size + 5);
   return result;
 }

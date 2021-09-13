@@ -92,6 +92,14 @@ class LEVELDB_EXPORT Status {
   Status(Code code, const Slice& msg, const Slice& msg2);
   static const char* CopyState(const char* s);
 
+  friend class DBImpl;
+
+  struct orbit_copy_flag {};
+  // Copy constructor from raw part used only by the orbit.
+  // The second arg flag is used to prevent accidental copy.
+  void assign(const char* s, orbit_copy_flag);
+  static const char* CopyState_orbit(const char* s);
+
   // OK status has a null state_.  Otherwise, state_ is a new[] array
   // of the following form:
   //    state_[0..3] == length of message
@@ -115,6 +123,13 @@ inline Status& Status::operator=(const Status& rhs) {
 inline Status& Status::operator=(Status&& rhs) noexcept {
   std::swap(state_, rhs.state_);
   return *this;
+}
+inline void Status::assign(const char* s, orbit_copy_flag)
+{
+  if (state_ != s) {
+    delete[] state_;
+    state_ = (s == nullptr) ? nullptr : CopyState(s);
+  }
 }
 
 }  // namespace leveldb

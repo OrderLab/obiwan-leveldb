@@ -21,6 +21,7 @@
 
 #include "db/dbformat.h"
 #include "db/version_edit.h"
+#include "leveldb/env.h"
 #include "port/port.h"
 #include "port/thread_annotations.h"
 
@@ -44,8 +45,28 @@ class WritableFile;
 // Return the smallest index i such that files[i]->largest >= key.
 // Return files.size() if there is no such file.
 // REQUIRES: "files" contains a sorted list of non-overlapping files.
+template<class Alloc>
 int FindFile(const InternalKeyComparator& icmp,
-             const std::vector<FileMetaData*>& files, const Slice& key);
+             const std::vector<FileMetaData*, Alloc>& files, const Slice& key)
+{
+  uint32_t left = 0;
+  uint32_t right = files.size();
+  while (left < right) {
+    uint32_t mid = (left + right) / 2;
+    const FileMetaData* f = files[mid];
+    if (icmp.InternalKeyComparator::Compare(f->largest.Encode(), key) < 0) {
+      // Key at "mid.largest" is < "target".  Therefore all
+      // files at or before "mid" are uninteresting.
+      left = mid + 1;
+    } else {
+      // Key at "mid.largest" is >= "target".  Therefore all files
+      // after "mid" are uninteresting.
+      right = mid;
+    }
+  }
+  return right;
+}
+
 
 // Returns true iff some file in "files" overlaps the user key range
 // [*smallest,*largest].
@@ -53,11 +74,61 @@ int FindFile(const InternalKeyComparator& icmp,
 // largest==nullptr represents a key largest than all keys in the DB.
 // REQUIRES: If disjoint_sorted_files, files[] contains disjoint ranges
 //           in sorted order.
+template<class Alloc>
 bool SomeFileOverlapsRange(const InternalKeyComparator& icmp,
                            bool disjoint_sorted_files,
-                           const std::vector<FileMetaData*>& files,
+                           const std::vector<FileMetaData*, Alloc>& files,
                            const Slice* smallest_user_key,
-                           const Slice* largest_user_key);
+                           const Slice* largest_user_key)
+{
+  auto AfterFile = [](const Comparator* ucmp, const Slice* user_key,
+      const FileMetaData* f) -> bool
+  {
+    // null user_key occurs before all keys and is therefore never after *f
+    return (user_key != nullptr &&
+        ucmp->Compare(*user_key, f->largest.user_key()) > 0);
+  };
+
+  auto BeforeFile = [](const Comparator* ucmp, const Slice* user_key,
+                       const FileMetaData* f) -> bool
+  {
+    // null user_key occurs after all keys and is therefore never before *f
+    return (user_key != nullptr &&
+        ucmp->Compare(*user_key, f->smallest.user_key()) < 0);
+  };
+
+  const Comparator* ucmp = icmp.user_comparator();
+  if (!disjoint_sorted_files) {
+    // Need to check against all files
+    for (size_t i = 0; i < files.size(); i++) {
+      const FileMetaData* f = files[i];
+      if (AfterFile(ucmp, smallest_user_key, f) ||
+          BeforeFile(ucmp, largest_user_key, f)) {
+        // No overlap
+      } else {
+        return true;  // Overlap
+      }
+    }
+    return false;
+  }
+
+  // Binary search over file list
+  uint32_t index = 0;
+  if (smallest_user_key != nullptr) {
+    // Find the earliest possible internal key for smallest_user_key
+    InternalKey small_key(*smallest_user_key, kMaxSequenceNumber,
+                          kValueTypeForSeek);
+    index = FindFile(icmp, files, small_key.Encode());
+  }
+
+  if (index >= files.size()) {
+    // beginning of range is after all files, so no overlap.
+    return false;
+  }
+
+  return !BeforeFile(ucmp, largest_user_key, files[index]);
+}
+
 
 class Version : public orbit::global_new_operator {
  public:
@@ -120,7 +191,10 @@ class Version : public orbit::global_new_operator {
   friend class Compaction;
   friend class VersionSet;
 
+  template<template <typename> class Alloc = std::allocator>
   class LevelFileNumIterator;
+
+  class obj_tracker;
 
   explicit Version(VersionSet* vset)
       : vset_(vset),
@@ -135,19 +209,7 @@ class Version : public orbit::global_new_operator {
   struct orbit_copy_flag {};
   // Copy constructor used only by the orbit.
   // The second arg flag is used to prevent accidental copy.
-  Version(const Version& rhs, orbit_copy_flag)
-      : vset_(rhs.vset_),
-        refs_(rhs.refs_),
-        file_to_compact_(nullptr),
-        file_to_compact_level_(-1),
-        compaction_score_(rhs.compaction_score_),
-        compaction_level_(rhs.compaction_level_)
-  {
-    // New Version sent from orbit should just have those as init value.
-    assert(rhs.file_to_compact_ == nullptr);
-    assert(rhs.file_to_compact_level_ == -1);
-    // FIXME: add sanitization
-  }
+  Version(const Version& rhs, obj_tracker *tracker, orbit_copy_flag);
 
   Version(const Version&) = delete;
   Version& operator=(const Version&) = delete;
@@ -170,8 +232,8 @@ class Version : public orbit::global_new_operator {
   int refs_;          // Number of live refs to this version
 
   // List of files per level
-  typedef std::vector<FileMetaData*, orbit::allocator<FileMetaData*>> Files;
-  std::vector<FileMetaData*> files_[config::kNumLevels];
+  typedef std::vector<FileMetaData*, orbit::global_allocator<FileMetaData*>> Files;
+  Files files_[config::kNumLevels];
 
   // Next file to compact based on seek stats.
   FileMetaData* file_to_compact_;
@@ -297,6 +359,7 @@ class VersionSet : public orbit::global_new_operator {
 
   friend class Compaction;
   friend class Version;
+  friend class DBImpl;
 
   bool ReuseManifest(const std::string& dscname, const std::string& dscbase);
 
@@ -315,12 +378,16 @@ class VersionSet : public orbit::global_new_operator {
   Status WriteSnapshot(log::Writer* log);
 
   void AppendVersion(Version* v);
-  void AppendVersion_orbit(Version* v, orbit_scratch *scratch);
+  void AppendVersion_orbit(Version* v, orbit_scratch *scratch, Version::obj_tracker *tracker);
 
   Env* const env_;
   const std::string dbname_;
   const Options* const options_;
-  TableCache* const table_cache_;
+  TableCache* table_cache_;
+  // TableCache* const table_cache_;
+  // orbit: same reason as DBImpl. We have to drop the const qualifier now.
+  // TODO: is there a better way to modify this?
+
   const InternalKeyComparator icmp_;
   uint64_t next_file_number_;
   uint64_t manifest_file_number_;
@@ -336,7 +403,7 @@ class VersionSet : public orbit::global_new_operator {
 
   // Per-level key at which the next compaction at that level should start.
   // Either an empty string, or a valid InternalKey.
-  std::string compact_pointer_[config::kNumLevels];
+  orbit_string compact_pointer_[config::kNumLevels];
 };
 
 // A Compaction encapsulates information about a compaction.

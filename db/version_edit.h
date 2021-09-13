@@ -15,7 +15,7 @@ namespace leveldb {
 
 class VersionSet;
 
-struct FileMetaData {
+struct FileMetaData : public orbit::global_new_operator {
   FileMetaData() : refs(0), allowed_seeks(1 << 30), file_size(0) {}
 
   int refs;
@@ -24,6 +24,13 @@ struct FileMetaData {
   uint64_t file_size;    // File size in bytes
   InternalKey smallest;  // Smallest internal key served by table
   InternalKey largest;   // Largest internal key served by table
+private:
+  friend class VersionSet;
+  struct orbit_copy_flag {};
+  FileMetaData(const FileMetaData &rhs, orbit_copy_flag)
+      : refs(rhs.refs), allowed_seeks(rhs.allowed_seeks),
+        number(rhs.number), file_size(rhs.file_size),
+        smallest(rhs.smallest), largest(rhs.largest) {}
 };
 
 class VersionEdit {

@@ -19,13 +19,6 @@
 
 namespace leveldb {
 
-// Standard Put... routines append to a string
-void PutFixed32(std::string* dst, uint32_t value);
-void PutFixed64(std::string* dst, uint64_t value);
-void PutVarint32(std::string* dst, uint32_t value);
-void PutVarint64(std::string* dst, uint64_t value);
-void PutLengthPrefixedSlice(std::string* dst, const Slice& value);
-
 // Standard Get... routines parse a value from the beginning of a Slice
 // and advance the slice past the parsed value.
 bool GetVarint32(Slice* input, uint32_t* value);
@@ -73,6 +66,41 @@ inline void EncodeFixed64(char* dst, uint64_t value) {
   buffer[5] = static_cast<uint8_t>(value >> 40);
   buffer[6] = static_cast<uint8_t>(value >> 48);
   buffer[7] = static_cast<uint8_t>(value >> 56);
+}
+
+// Standard Put... routines append to a string
+template<template<typename> class Alloc>
+void PutFixed32(alloc_string<Alloc>* dst, uint32_t value) {
+  char buf[sizeof(value)];
+  EncodeFixed32(buf, value);
+  dst->append(buf, sizeof(buf));
+}
+
+template<template<typename> class Alloc>
+void PutFixed64(alloc_string<Alloc>* dst, uint64_t value) {
+  char buf[sizeof(value)];
+  EncodeFixed64(buf, value);
+  dst->append(buf, sizeof(buf));
+}
+
+template<template<typename> class Alloc>
+void PutVarint32(alloc_string<Alloc>* dst, uint32_t v) {
+  char buf[5];
+  char* ptr = EncodeVarint32(buf, v);
+  dst->append(buf, ptr - buf);
+}
+
+template<template<typename> class Alloc>
+void PutVarint64(alloc_string<Alloc>* dst, uint64_t v) {
+  char buf[10];
+  char* ptr = EncodeVarint64(buf, v);
+  dst->append(buf, ptr - buf);
+}
+
+template<template<typename> class Alloc>
+void PutLengthPrefixedSlice(alloc_string<Alloc>* dst, const Slice& value) {
+  PutVarint32(dst, value.size());
+  dst->append(value.data(), value.size());
 }
 
 // Lower-level versions of Get... that read directly from a character buffer

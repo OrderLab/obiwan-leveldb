@@ -11,6 +11,7 @@
 
 #include "leveldb/comparator.h"
 #include "leveldb/db.h"
+#include "leveldb/env.h"
 #include "leveldb/filter_policy.h"
 #include "leveldb/slice.h"
 #include "leveldb/table_builder.h"
@@ -83,7 +84,17 @@ inline size_t InternalKeyEncodingLength(const ParsedInternalKey& key) {
 }
 
 // Append the serialization of "key" to *result.
-void AppendInternalKey(std::string* result, const ParsedInternalKey& key);
+template<template<typename> class Alloc>
+void AppendInternalKey(alloc_string<Alloc>* result, const ParsedInternalKey& key) {
+  result->append(key.user_key.data(), key.user_key.size());
+
+  auto PackSequenceAndType = [](uint64_t seq, ValueType t) -> uint64_t {
+    assert(seq <= kMaxSequenceNumber);
+    assert(t <= kValueTypeForSeek);
+    return (seq << 8) | t;
+  };
+  PutFixed64(result, PackSequenceAndType(key.sequence, key.type));
+}
 
 // Attempt to parse an internal key from "internal_key".  On success,
 // stores the parsed data in "*result", and returns true.
@@ -133,7 +144,7 @@ class InternalFilterPolicy : public FilterPolicy {
 // incorrectly use string comparisons instead of an InternalKeyComparator.
 class InternalKey {
  private:
-  std::string rep_;
+  orbit_string rep_;
 
  public:
   InternalKey() {}  // Leave rep_ as empty to indicate it is invalid

@@ -22,6 +22,9 @@
 
 #include "leveldb/export.h"
 
+template<template<typename> class Alloc>
+using alloc_string = std::basic_string<char, std::char_traits<char>, Alloc<char>>;
+
 namespace leveldb {
 
 class LEVELDB_EXPORT Slice {
@@ -34,6 +37,9 @@ class LEVELDB_EXPORT Slice {
 
   // Create a slice that refers to the contents of "s"
   Slice(const std::string& s) : data_(s.data()), size_(s.size()) {}
+  template<template<typename> class Alloc>
+  Slice(const alloc_string<Alloc>& s) : data_(s.data()), size_(s.size()) {}
+  // Slice(const alloc_string(Alloc)& s) : data_(s.data()), size_(s.size()) {}
 
   // Create a slice that refers to s[0,strlen(s)-1]
   Slice(const char* s) : data_(s), size_(strlen(s)) {}
@@ -73,6 +79,11 @@ class LEVELDB_EXPORT Slice {
 
   // Return a string that contains the copy of the referenced data.
   std::string ToString() const { return std::string(data_, size_); }
+  template<template<typename> class Alloc>
+  alloc_string<Alloc> ToString() const { return alloc_string<Alloc>(data_, size_); }
+  // alloc_string(Alloc) ToString() const { return alloc_string(Alloc)(data_, size_); }
+
+  class orbit_string;
 
   // Three-way comparison.  Returns value:
   //   <  0 iff "*this" <  "b",

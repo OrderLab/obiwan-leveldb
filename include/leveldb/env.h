@@ -45,6 +45,17 @@
 #define assert_not_orbit_context() do { assert(!is_orbit_context()); } while (0)
 #endif
 
+typedef alloc_string<orbit::global_allocator> orbit_string;
+
+inline bool operator==(const orbit_string &s1, const std::string &s2)
+{
+  return s1.compare(0, s1.size(), s2.data(), s2.size()) == 0;
+}
+inline bool operator==(const std::string &s1, const orbit_string &s2)
+{
+  return s2 == s1;
+}
+
 // This workaround can be removed when leveldb::Env::DeleteFile is removed.
 #if defined(_WIN32)
 // On Windows, the method name DeleteFile (below) introduces the risk of

@@ -686,7 +686,6 @@ void DBImpl::RecordBackgroundError(const Status& s) {
   }
 }
 
-// FIXME: Port `Status` to allow sending back with orbit
 void DBImpl::RecordBackgroundError_orbit(const Status& s, orbit_scratch *scratch) {
   assert_orbit_context();
   // mutex_.AssertHeld();
@@ -694,7 +693,9 @@ void DBImpl::RecordBackgroundError_orbit(const Status& s, orbit_scratch *scratch
     bg_error_ = s;
     // background_work_finished_signal_.SignalAll();
     DBImpl *thisptr = this;
-    orbit_scratch_run1(scratch, DBImpl*, thisptr, {
+    const char *raw_state = Status::CopyState_orbit(s.state_);
+    orbit_scratch_run2(scratch, DBImpl*, thisptr, const char *, raw_state, {
+      thisptr->bg_error_.assign(raw_state, Status::orbit_copy_flag());
       thisptr->background_work_finished_signal_.SignalAll();
     });
   }
@@ -838,12 +839,41 @@ void DBImpl::BackgroundCall() {
   } else if (!bg_error_.ok()) {
     // No more background work after a background error.
   } else {
-    // RK: Note that currently we are recreating the table cache so we do not
+    // orbit: Note that currently we are recreating the table cache so we do not
     // need to copy the LRUCache, though this may or may not affect the performance.
     // WARN: Note that the this TableCache may use option_.block_cache, which
     // is a `Cache*` and it may cause problem due to incomplete porting.
     table_cache_ = new TableCache(dbname_, options_, TableCacheSize(options_));
+    versions_->table_cache_ = table_cache_;
+    // orbit: VersionSet::compact_pointer_ needs to be reallocated in scratch.
+    // We force call the constructor without calling the destructor. This will
+    // make the string in the snapshotted leak, but this is fine since the
+    // snapshotted pool will be updated next time anyway.
+    // Those data will also be copied back to main program.
+    std::vector<Slice> pointers;
+    for (int i = 0; i < config::kNumLevels; ++i) {
+      Slice slice(versions_->compact_pointer_[i]);
+      pointers.push_back(slice);
+      ::new (&versions_->compact_pointer_[i]) orbit_string(slice.data(), slice.size());
+    }
+    assert(pending_outputs_.size() == 0);
+    ::new (&pending_outputs_) std::set<uint64_t>();
+    ::new (&bg_error_) Status();
+
     BackgroundCompaction_orbit(&scratch);
+
+    assert(pending_outputs_.size() == 0);
+    // Compare with the old pointers. Apply update if it is updated.
+    for (int i = 0; i < config::kNumLevels; ++i) {
+      if (pointers[i] != versions_->compact_pointer_[i]) {
+        orbit_string *str = &versions_->compact_pointer_[i];
+        const char *data = str->data();
+        size_t size = str->size();
+        orbit_scratch_run3(&scratch, orbit_string*, str, const char *, data, size_t, size, {
+          str->assign(data, size);
+        });
+      }
+    }
   }
 
   background_compaction_scheduled_ = false;
@@ -1005,7 +1035,6 @@ Status DBImpl::OpenCompactionOutputFile(CompactionState* compact) {
     // FIXME: add logic for the new file number part
     file_number = versions_->NewFileNumber();
     pending_outputs_.insert(file_number);
-    // FIXME: add differentiable allocation for InternalKey::rep_.
     CompactionState::Output out;
     out.number = file_number;
     out.smallest.Clear();
@@ -1261,7 +1290,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
     (unsigned long)stats.micros, (unsigned long)stats.bytes_read,
     (unsigned long)stats.bytes_written, };
   orbit_scratch_push_operation(scratch, &DBImpl::obop_addstats, 5, args);
-  // stats_[compact->compaction->level() + 1].Add(stats);
+  stats_[compact->compaction->level() + 1].Add(stats);
 
   if (status.ok()) {
     status = InstallCompactionResults(compact);
