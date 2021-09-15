@@ -236,6 +236,8 @@ class Version : public orbit::global_new_operator {
   Files files_[config::kNumLevels];
 
   // Next file to compact based on seek stats.
+// FIXME: remove this public and make them back to private again
+ public:
   FileMetaData* file_to_compact_;
   int file_to_compact_level_;
 

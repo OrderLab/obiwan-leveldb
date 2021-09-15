@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <iostream>
 
 #include "db/filename.h"
 #include "db/log_reader.h"
@@ -75,6 +76,17 @@ struct Version::obj_tracker : public orbit::global_new_operator {
   read_added_file_t real_added_files;
 };
 
+template <class A, class B>
+void __assert_eq(A x, B y, const char *nx, const char *ny) {
+  if (x == y) return;
+  std::cout << nx << " is " << x << ", " << ny << " is " << y << std::endl;
+  abort();
+}
+
+#define assert_eq(x, y) do { \
+  __assert_eq((x), (y), #x, #y); \
+} while (0)
+
 Version::Version(const Version& rhs, obj_tracker *tracker, orbit_copy_flag)
     : vset_(rhs.vset_),
       refs_(rhs.refs_),
@@ -84,8 +96,11 @@ Version::Version(const Version& rhs, obj_tracker *tracker, orbit_copy_flag)
       compaction_level_(rhs.compaction_level_)
 {
   // New Version sent from orbit should just have those as init value.
-  assert(rhs.file_to_compact_ == nullptr);
-  assert(rhs.file_to_compact_level_ == -1);
+  fprintf(stderr, "rhs %p %p %p\n", &rhs, &rhs.file_to_compact_, &rhs.vset_);
+  //fprintf(stderr, "this %p\n", this);
+  assert_eq((void*)rhs.file_to_compact_, (void*)0);
+  //assert_eq((void*)rhs.vset_, (void*)1);
+  assert_eq(rhs.file_to_compact_level_, -1);
   // Rewrite files_ pointer for new files.
   for (int i = 0; i < config::kNumLevels; ++i) {
     if (rhs.files_[i].empty()) continue;
@@ -594,7 +609,6 @@ class VersionSet::Builder {
 
   // Apply all of the edits in *edit to the current state.
   void Apply(VersionEdit* edit) {
-    assert(is_orbit_context() ^ (!tracker));
     // Update compaction pointers
     for (size_t i = 0; i < edit->compact_pointers_.size(); i++) {
       const int level = edit->compact_pointers_[i].first;
@@ -834,19 +848,27 @@ void VersionSet::AppendVersion_orbit(Version* v, orbit_scratch *scratch,
   v->next_->prev_ = v;
 
   VersionSet *vset = this;
+    fprintf(stderr, "file_to_compact_level_ %d\n", v->file_to_compact_level_);
   orbit_scratch_run3(scratch, VersionSet *, vset, Version *, v, Version::obj_tracker *, tracker, {
-    Version *v = new Version(*v, tracker, Version::orbit_copy_flag());
+    void dump_last_mem(void);
+    dump_last_mem();
+    fprintf(stderr, "file_to_compact_level_ %p %d\n", v, v->file_to_compact_level_);
+    // __asm__ ("int3");
+    // RK: Note that this `vnew` must have different name from `v`, otherwise
+    // it will be used in the copy constructor, because it was shadowed in the
+    // same line, not after this line..
+    Version *vnew = new Version(*v, tracker, Version::orbit_copy_flag());
     if (vset->current_ != nullptr) {
       vset->current_->Unref();
     }
-    vset->current_ = v;
+    vset->current_ = vnew;
     // No need to increment the ref since we have already copied the updated
     // one. Only rewrite the pointers.
 
-    v->prev_ = vset->dummy_versions_.prev_;
-    v->next_ = &vset->dummy_versions_;
-    v->prev_->next_ = v;
-    v->next_->prev_ = v;
+    vnew->prev_ = vset->dummy_versions_.prev_;
+    vnew->next_ = &vset->dummy_versions_;
+    vnew->prev_->next_ = vnew;
+    vnew->next_->prev_ = vnew;
   });
 }
 
@@ -954,10 +976,12 @@ Status VersionSet::LogAndApply_orbit(VersionEdit* edit, orbit_scratch *scratch) 
 
   Version::obj_tracker *tracker = new Version::obj_tracker;
   Version* v = new Version(this);
+  fprintf(stderr, "file_to_compact_level_ %p %d\n", v, v->file_to_compact_level_);
   {
     Builder builder(this, current_);
     builder.Apply(edit);
     builder.SaveTo_orbit(v, tracker);
+    fprintf(stderr, "file_to_compact_level_ %d\n", v->file_to_compact_level_);
     orbit_scratch_run1(scratch, Version::obj_tracker *, tracker, {
       for (FileMetaData *f : tracker->add_ref_files) {
         f->refs++;
@@ -968,6 +992,7 @@ Status VersionSet::LogAndApply_orbit(VersionEdit* edit, orbit_scratch *scratch) 
     });
   }
   Finalize(v);
+  fprintf(stderr, "file_to_compact_level_ %d\n", v->file_to_compact_level_);
 
   // Initialize new descriptor log file if necessary by creating
   // a temporary file that contains a snapshot of the current version.
@@ -1666,6 +1691,7 @@ Compaction* VersionSet::CompactRange(int level, const InternalKey* begin,
   Compaction* c = new Compaction(options_, level);
   c->input_version_ = current_;
   c->input_version_->Ref();
+  // RK: this is also copy construct instead of move, right?
   c->inputs_[0] = inputs;
   SetupOtherInputs(c);
   return c;

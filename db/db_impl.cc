@@ -11,6 +11,9 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <iostream>
+
+#include <unistd.h>
 
 #include "db/builder.h"
 #include "db/db_iter.h"
@@ -616,7 +619,8 @@ void DBImpl::CompactRange(const Slice* begin, const Slice* end) {
       }
     }
   }
-  TEST_CompactMemTable();  // TODO(sanjay): Skip if memtable does not overlap
+  // FIXME(orbit): we should support memtable compaction
+  // TEST_CompactMemTable();  // TODO(sanjay): Skip if memtable does not overlap
   for (int level = 0; level < max_level_with_files; level++) {
     TEST_CompactRange(level, begin, end);
   }
@@ -627,22 +631,24 @@ void DBImpl::TEST_CompactRange(int level, const Slice* begin,
   assert(level >= 0);
   assert(level + 1 < config::kNumLevels);
 
-  InternalKey begin_storage, end_storage;
+  InternalKey *begin_storage = nullptr, *end_storage = nullptr;
 
-  ManualCompaction manual;
+  ManualCompaction *manual_ = new ManualCompaction, &manual = *manual_;
   manual.level = level;
   manual.done = false;
   if (begin == nullptr) {
     manual.begin = nullptr;
   } else {
-    begin_storage = InternalKey(*begin, kMaxSequenceNumber, kValueTypeForSeek);
-    manual.begin = &begin_storage;
+    // RK: original version is also using copy constructor right?
+    // original: begin_storage = InternalKey(...); same to end_storage
+    begin_storage = new InternalKey(*begin, kMaxSequenceNumber, kValueTypeForSeek);
+    manual.begin = begin_storage;
   }
   if (end == nullptr) {
     manual.end = nullptr;
   } else {
-    end_storage = InternalKey(*end, 0, static_cast<ValueType>(0));
-    manual.end = &end_storage;
+    end_storage = new InternalKey(*end, 0, static_cast<ValueType>(0));
+    manual.end = end_storage;
   }
 
   MutexLock l(&mutex_);
@@ -659,6 +665,9 @@ void DBImpl::TEST_CompactRange(int level, const Slice* begin,
     // Cancel my manual compaction since we aborted early for some reason.
     manual_compaction_ = nullptr;
   }
+  delete manual_;
+  delete begin_storage;
+  delete end_storage;
 }
 
 Status DBImpl::TEST_CompactMemTable() {
@@ -717,16 +726,20 @@ void DBImpl::MaybeScheduleCompaction() {
     // No work to be done
   } else {
     fprintf(stderr, "orbit: scheduling compaction\n");
+    fprintf(stderr, "orbit: scheduling imm=%p manual=%p, score=%f, file=%p\n",
+        imm_, manual_compaction_, versions_->current_->compaction_score_,
+        versions_->current_->file_to_compact_);
     background_compaction_scheduled_ = true;
 
-    struct orbit_module *ob = orbit_create("bgcompact", DBImpl::BGWork_orbit, NULL);
+    if (ob_ == nullptr)
+      ob_ = orbit_create("bgcompact", DBImpl::BGWork_orbit, NULL);
 
     // env_->Schedule(&DBImpl::BGWork, this);
     // TODO: the ideal way of manual integration for orbit_call will be adding
     // an orbit API in Env.
     struct orbit_task task;
     DBImpl *thisptr = this;
-    int ret = orbit_call_async(ob, 0, 1, &bgc_pool, NULL, &thisptr, sizeof(thisptr), &task);
+    int ret = orbit_call_async(ob_, 0, 1, &bgc_pool, NULL, &thisptr, sizeof(thisptr), &task);
     if (ret != 0) {
       fprintf(stderr, "orbit: error making obcall!\n");
       return;
@@ -756,7 +769,7 @@ void DBImpl::orbit_waiter_queue::push(orbit_task task)
 bool DBImpl::orbit_waiter_queue::pop(orbit_task *task, const std::atomic<bool> &shutting_down)
 {
   qmu_.Lock();
-  while (queue_.empty() && shutting_down.load(std::memory_order_acquire)) {
+  while (queue_.empty() && !shutting_down.load(std::memory_order_acquire)) {
     qcv_.Wait();
   }
   if (shutting_down.load(std::memory_order_acquire)) {
@@ -768,6 +781,34 @@ bool DBImpl::orbit_waiter_queue::pop(orbit_task *task, const std::atomic<bool> &
   queue_.pop();
   qmu_.Unlock();
   return true;
+}
+
+template <class A>
+void __assert_eq(A x, A y, const char *nx, const char *ny) {
+  if (x == y) return;
+  std::cout << nx << " is " << x << ", " << ny << " is " << y << std::endl;
+  // while(1)sleep(10000);
+  abort();
+}
+
+#define assert_eq(x, y) do { \
+  __assert_eq((x), (y), #x, #y); \
+} while (0)
+
+static char *start;
+static char *end;
+void dump_last_mem(void)
+{
+#if 0
+  for (char *x = start; x != end; ++x) {
+    if (((x - start) & 31) == 0)
+      fprintf(stderr, "%p ", x);
+    fprintf(stderr, " %02hhx", *x);
+    if (((x - start) & 31) == 31)
+      fprintf(stderr, "\n");
+  }
+  fprintf(stderr, "\n");
+#endif
 }
 
 void DBImpl::ob_bgwait(void *db_)
@@ -785,16 +826,25 @@ void DBImpl::ob_bgwait(void *db_)
     int ret;
 
     ret = orbit_recvv(&result_pool, &task);
-    assert(ret == 1);
+    fprintf(stderr, "recv %p %lu %lu\n", result_pool.scratch.ptr,
+        result_pool.scratch.cursor, result_pool.scratch.size_limit);
+    start = (char*)result_pool.scratch.ptr + result_pool.scratch.size_limit - 4096 * 1;
+    end = (char*)result_pool.scratch.ptr + result_pool.scratch.size_limit - 4096 * 0;
+    dump_last_mem();
+
+    assert_eq(ret, 1);
     ret = orbit_recvv(&result_updates, &task);
-    assert(ret == 1);
+    fprintf(stderr, "recv %p %lu %lu\n", result_updates.scratch.ptr,
+        result_updates.scratch.cursor, result_updates.scratch.size_limit);
+    dump_last_mem();
+    assert_eq(ret, 1);
     ret = orbit_recvv(&result_retval, &task);
-    assert(ret == 0);
+    assert_eq(ret, 0);
     fprintf(stderr, "orbit: task received!\n");
 
     db->mutex_.Lock();
     orbit_type apply_res = orbit_apply(&result_updates.scratch, false);
-    assert(apply_res == ORBIT_END);
+    assert_eq(apply_res, ORBIT_END);
     db->mutex_.Unlock();
     fprintf(stderr, "orbit: scratch applied!\n");
   }
@@ -816,6 +866,8 @@ void DBImpl::BackgroundCall() {
   orbit_scratch scratch;
   orbit_scratch_create(&scratch);
 
+  fprintf(stderr, "still alive 1\n");
+
   // FIXME: Do not create the alloc at the same place for the entire pool
   // every time.
   orbit_allocator *reply_alloc = orbit_allocator_from_pool(bgc_reply_pool, true);
@@ -824,6 +876,7 @@ void DBImpl::BackgroundCall() {
   // transparently allocate all the objects that need to be sent back to the
   // main program.
   orbit::set_global_allocator(reply_alloc);
+  fprintf(stderr, "still alive 2\n");
 
   /* ORBIT_SYNC_TAG Orbit already have a snapshot of all the states, so
    * we do not need to worry that we see inconsistent states without a lock in
@@ -860,7 +913,11 @@ void DBImpl::BackgroundCall() {
     ::new (&pending_outputs_) std::set<uint64_t>();
     ::new (&bg_error_) Status();
 
+    void *dummy = orbit_alloc(reply_alloc, sizeof(int));
+
+    fprintf(stderr, "still alive 3\n");
     BackgroundCompaction_orbit(&scratch);
+    fprintf(stderr, "still alive 4\n");
 
     assert(pending_outputs_.size() == 0);
     // Compare with the old pointers. Apply update if it is updated.
@@ -874,6 +931,7 @@ void DBImpl::BackgroundCall() {
         });
       }
     }
+    fprintf(stderr, "still alive 5\n");
   }
 
   background_compaction_scheduled_ = false;
@@ -894,14 +952,23 @@ void DBImpl::BackgroundCall() {
   // TODO: This is a way to reuse the current scratch API to send pool ranges.
   // We should instead directly have a pool range send API, and that would be
   // much more flexible and ergonomic.
-  orbit_scratch reply_virtual_scratch;
-  reply_virtual_scratch.ptr = reply_alloc->start;
-  reply_virtual_scratch.size_limit = *reply_alloc->allocated;
+  orbit_scratch reply_virtual_scratch = (orbit_scratch) {
+    .ptr = reply_alloc->start,
+    .cursor = *reply_alloc->allocated,
+    .size_limit = *reply_alloc->allocated,
+    .count = 0,
+    .any_alloc = nullptr,
+  };
+  fprintf(stderr, "still alive 6: %p %lu %lu\n", reply_virtual_scratch.ptr,
+      reply_virtual_scratch.cursor, reply_virtual_scratch.size_limit);
   int ret = orbit_sendv(&reply_virtual_scratch), err = errno;
+  fprintf(stderr, "still alive 6.1\n");
   if (ret != 0)
     fprintf(stderr, "orbit_sendv reply returns error %d: %s\n", err, strerror(err));
 
+  fprintf(stderr, "still alive 7\n");
   ret = orbit_sendv(&scratch), err = errno;
+  fprintf(stderr, "still alive 7.1\n");
   if (ret != 0)
     fprintf(stderr, "orbit_sendv scratch returns error %d: %s\n", err, strerror(err));
 }
@@ -920,15 +987,14 @@ void DBImpl::BackgroundCompaction_orbit(orbit_scratch *scratch) {
 
   Compaction* c;
   bool is_manual = (manual_compaction_ != nullptr);
-  InternalKey manual_end;
+  InternalKey *manual_end_ = new InternalKey, &manual_end = *manual_end_;
   if (is_manual) {
     /* BTW, allocation of manual_compaction_ needs to be moved from stack
      * to orbit pool.*/
-    fprintf(stderr, "orbit: we should not enter this manual branch\n");
-    abort();
     ManualCompaction* m = manual_compaction_;
     c = versions_->CompactRange(m->level, m->begin, m->end);
     m->done = (c == nullptr);
+    orbit_scratch_push_update(scratch, &m->done, sizeof(m->done));
     if (c != nullptr) {
       manual_end = c->input(0, c->num_input_files(0) - 1)->largest;
     }
@@ -971,7 +1037,7 @@ void DBImpl::BackgroundCompaction_orbit(orbit_scratch *scratch) {
     }
     CleanupCompaction(compact);
     c->ReleaseInputs();
-    RemoveObsoleteFiles();
+    RemoveObsoleteFiles(scratch);
   }
   delete c;
 
@@ -990,19 +1056,24 @@ void DBImpl::BackgroundCompaction_orbit(orbit_scratch *scratch) {
    * bring additional add-on benefits? ORBIT_ROLLBACK_TAG */
 
   if (is_manual) {
-    fprintf(stderr, "orbit: we should not enter this manual branch\n");
-    abort();
     ManualCompaction* m = manual_compaction_;
     if (!status.ok()) {
       m->done = true;
+      orbit_scratch_push_update(scratch, &m->done, sizeof(m->done));
     }
     if (!m->done) {
       // We only compacted part of the requested range.  Update *m
       // to the range that is left to be compacted.
-      m->tmp_storage = manual_end;
+      // FIXME: safely do this in orbit
+      // m->tmp_storage = manual_end;
       m->begin = &m->tmp_storage;
+      orbit_scratch_run2(scratch, ManualCompaction *, m, InternalKey *, manual_end_, {
+        m->tmp_storage = *manual_end_;
+        m->begin = &m->tmp_storage;
+      });
     }
     manual_compaction_ = nullptr;
+    orbit_scratch_push_update(scratch, &manual_compaction_, sizeof(manual_compaction_));
   }
 }
 

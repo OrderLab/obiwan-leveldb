@@ -77,11 +77,13 @@ Status Writer::AddRecord(const Slice& slice, orbit_scratch *scratch) {
     left -= fragment_length;
     begin = false;
   } while (s.ok() && left > 0);
-  // TODO(orbit): ORBIT_ROLLBACK_TAG What to do if the `s` shows error?
-  // TODO: will we allocate new log and desc so we need to sanitize the pointers?
-  orbit_scratch_push_update(scratch, this, sizeof(*this));
-  dest_->push_orbit_update(scratch);
-  // TODO: error handling for above 2 push_update
+  if (scratch) {
+    // TODO(orbit): ORBIT_ROLLBACK_TAG What to do if the `s` shows error?
+    // TODO: will we allocate new log and desc so we need to sanitize the pointers?
+    orbit_scratch_push_update(scratch, this, sizeof(*this));
+    dest_->push_orbit_update(scratch);
+    // TODO: error handling for above 2 push_update
+  }
   return s;
 }
 

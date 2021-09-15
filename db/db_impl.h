@@ -80,7 +80,7 @@ class DBImpl : public DB, public orbit::global_new_operator {
   struct Writer;
 
   // Information for a manual compaction
-  struct ManualCompaction {
+  struct ManualCompaction : public orbit::global_new_operator {
     int level;
     bool done;
     const InternalKey* begin;  // null means beginning of key range
@@ -214,6 +214,8 @@ class DBImpl : public DB, public orbit::global_new_operator {
   ManualCompaction* manual_compaction_ GUARDED_BY(mutex_);
 
   VersionSet* const versions_ GUARDED_BY(mutex_);
+
+  orbit_module *ob_;
 
   struct orbit_waiter_queue {
     port::Mutex qmu_;
