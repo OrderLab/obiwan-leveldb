@@ -712,12 +712,16 @@ void DBImpl::RecordBackgroundError_orbit(const Status& s, orbit_scratch *scratch
 
 struct BGWork_orbit_args {
     DBImpl* db;
+    bool inject;
 };
 
 void DBImpl::MaybeScheduleCompaction() {
   assert_not_orbit_context();
   // std::cerr << std::endl;
   fprintf(stderr, "orbit: maybe schedule compaction\n");
+  fprintf(stderr, "orbit: pre-schedule imm=%p manual=%p, score=%f, file=%p\n",
+      imm_, manual_compaction_, versions_->current_->compaction_score_,
+      versions_->current_->file_to_compact_);
   mutex_.AssertHeld();
   if (background_compaction_scheduled_) {
     // Already scheduled
@@ -743,7 +747,10 @@ void DBImpl::MaybeScheduleCompaction() {
 
     // TODO: the ideal way of manual integration for orbit_call will be adding
     // an orbit API in Env.
-    BGWork_orbit_args args = { .db = this, };
+    static bool do_inject = false;
+    static int inject_counter = 0;
+    bool inject = (do_inject && ++inject_counter % 10 == 0);
+    BGWork_orbit_args args = { .db = this, .inject = inject, };
     struct orbit_task task;
     int ret = orbit_call_async(ob_, 0, 1, &bgc_pool, NULL, &args, sizeof(args), &task);
     if (ret != 0) {
@@ -830,6 +837,7 @@ void DBImpl::ob_bgwait(void *db_)
     orbit_result result_updates;
     orbit_result result_retval;
     int ret;
+    orbit_type apply_res;
 
     ret = orbit_recvv(&result_pool, &task);
     fprintf(stderr, "recv %p %lu %lu\n", result_pool.scratch.ptr,
@@ -837,22 +845,38 @@ void DBImpl::ob_bgwait(void *db_)
     start = (char*)result_pool.scratch.ptr + result_pool.scratch.size_limit - 4096 * 1;
     end = (char*)result_pool.scratch.ptr + result_pool.scratch.size_limit - 4096 * 0;
     dump_last_mem();
+    if (ret != 1) goto fail;
 
-    assert_eq(ret, 1);
     ret = orbit_recvv(&result_updates, &task);
     fprintf(stderr, "recv %p %lu %lu\n", result_updates.scratch.ptr,
         result_updates.scratch.cursor, result_updates.scratch.size_limit);
     dump_last_mem();
-    assert_eq(ret, 1);
+    if (ret != 1) goto fail;
+
     ret = orbit_recvv(&result_retval, &task);
-    assert_eq(ret, 0);
     fprintf(stderr, "orbit: task received!\n");
+    if (ret != 0) goto fail;
 
     db->mutex_.Lock();
-    orbit_type apply_res = orbit_apply(&result_updates.scratch, false);
-    assert_eq(apply_res, ORBIT_END);
+    apply_res = orbit_apply(&result_updates.scratch, false);
     db->mutex_.Unlock();
     fprintf(stderr, "orbit: scratch applied!\n");
+    if (apply_res != ORBIT_END) goto fail;
+    continue;
+fail:
+    fprintf(stderr, "orbit error!\n");
+    db->mutex_.Lock();
+    db->ob_ = orbit_create("bgcompact", DBImpl::BGWork_orbit, NULL);
+
+    //db->RecordBackgroundError(Status::IOError(Slice("Orbit error!")));
+    fprintf(stderr, "recorded bg error!\n");
+
+    db->background_compaction_scheduled_ = false;
+    // Previous compaction may have produced too many files in a level,
+    // so reschedule another compaction if needed.
+    db->MaybeScheduleCompaction();
+    db->background_work_finished_signal_.SignalAll();
+    db->mutex_.Unlock();
   }
 }
 
@@ -885,6 +909,8 @@ unsigned long DBImpl::BGWork_orbit(void *store, void* argbuf) {
   assert_orbit_context();
   (void)store;
   BGWork_orbit_args *args = (BGWork_orbit_args*)argbuf;
+  if (args->inject)
+    args->inject = *(bool*)NULL;
   args->db->BackgroundCall_orbit();
   return 0;
 }
