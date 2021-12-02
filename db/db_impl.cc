@@ -710,6 +710,10 @@ void DBImpl::RecordBackgroundError_orbit(const Status& s, orbit_scratch *scratch
   }
 }
 
+struct BGWork_orbit_args {
+    DBImpl* db;
+};
+
 void DBImpl::MaybeScheduleCompaction() {
   assert_not_orbit_context();
   // std::cerr << std::endl;
@@ -724,6 +728,9 @@ void DBImpl::MaybeScheduleCompaction() {
   } else if (imm_ == nullptr && manual_compaction_ == nullptr &&
              !versions_->NeedsCompaction()) {
     // No work to be done
+  } else if (imm_ != nullptr) {
+    background_compaction_scheduled_ = true;
+    env_->Schedule(&DBImpl::BGWork, this);
   } else {
     fprintf(stderr, "orbit: scheduling compaction\n");
     fprintf(stderr, "orbit: scheduling imm=%p manual=%p, score=%f, file=%p\n",
@@ -734,12 +741,11 @@ void DBImpl::MaybeScheduleCompaction() {
     if (ob_ == nullptr)
       ob_ = orbit_create("bgcompact", DBImpl::BGWork_orbit, NULL);
 
-    // env_->Schedule(&DBImpl::BGWork, this);
     // TODO: the ideal way of manual integration for orbit_call will be adding
     // an orbit API in Env.
+    BGWork_orbit_args args = { .db = this, };
     struct orbit_task task;
-    DBImpl *thisptr = this;
-    int ret = orbit_call_async(ob_, 0, 1, &bgc_pool, NULL, &thisptr, sizeof(thisptr), &task);
+    int ret = orbit_call_async(ob_, 0, 1, &bgc_pool, NULL, &args, sizeof(args), &task);
     if (ret != 0) {
       fprintf(stderr, "orbit: error making obcall!\n");
       return;
@@ -854,14 +860,36 @@ void DBImpl::BGWork(void* db) {
   reinterpret_cast<DBImpl*>(db)->BackgroundCall();
 }
 
-unsigned long DBImpl::BGWork_orbit(void *store, void* db) {
+void DBImpl::BackgroundCall() {
+  MutexLock l(&mutex_);
+  assert(background_compaction_scheduled_);
+  if (shutting_down_.load(std::memory_order_acquire)) {
+    // No more background work when shutting down.
+  } else if (!bg_error_.ok()) {
+    // No more background work after a background error.
+  } else {
+    if (imm_ != nullptr) {
+      CompactMemTable();
+    }
+  }
+
+  background_compaction_scheduled_ = false;
+
+  // Previous compaction may have produced too many files in a level,
+  // so reschedule another compaction if needed.
+  MaybeScheduleCompaction();
+  background_work_finished_signal_.SignalAll();
+}
+
+unsigned long DBImpl::BGWork_orbit(void *store, void* argbuf) {
   assert_orbit_context();
   (void)store;
-  (*reinterpret_cast<DBImpl**>(db))->BackgroundCall();
+  BGWork_orbit_args *args = (BGWork_orbit_args*)argbuf;
+  args->db->BackgroundCall_orbit();
   return 0;
 }
 
-void DBImpl::BackgroundCall() {
+void DBImpl::BackgroundCall_orbit() {
   assert_orbit_context();
   orbit_scratch scratch;
   orbit_scratch_create(&scratch);
@@ -978,12 +1006,8 @@ void DBImpl::BackgroundCompaction_orbit(orbit_scratch *scratch) {
   // ORBIT_SYNC_TAG
   // mutex_.AssertHeld();
 
-  /* FIXME: we have not ported the skiplist yet.  A more severe issue is
-   * that we cannot handle multiple LogAndApply yet. */
-  /* if (imm_ != nullptr) {
-    CompactMemTable();
-    return;
-  } */
+  /* Memtable compaction is now done in main's side, not in orbit. */
+  /* Another issue is that we cannot handle multiple LogAndApply yet. */
 
   Compaction* c;
   bool is_manual = (manual_compaction_ != nullptr);

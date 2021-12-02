@@ -148,6 +148,7 @@ class DBImpl : public DB, public orbit::global_new_operator {
   static unsigned long BGWork_orbit(void *store, void* db);
 
   void BackgroundCall();
+  void BackgroundCall_orbit();
   // void BackgroundCompaction() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
   void BackgroundCompaction_orbit(orbit_scratch *scratch);
       /* RK: We do not need EXCLUSIVE_LOCKS_REQUIRED(mutex_) for orbit. */
