@@ -22,6 +22,12 @@
 
 #include "orbit.h"
 
+#if 0
+#define obprintf(fmt, ...) do { fprintf(stderr, "orbit: " fmt, ##__VA_ARGS__); } while (0)
+#else
+#define obprintf(...) do { } while (0)
+#endif
+
 namespace leveldb {
 
 static size_t TargetFileSize(const Options* options) {
@@ -96,8 +102,8 @@ Version::Version(const Version& rhs, obj_tracker *tracker, orbit_copy_flag)
       compaction_level_(rhs.compaction_level_)
 {
   // New Version sent from orbit should just have those as init value.
-  fprintf(stderr, "rhs %p %p %p\n", &rhs, &rhs.file_to_compact_, &rhs.vset_);
-  //fprintf(stderr, "this %p\n", this);
+  obprintf("rhs %p %p %p\n", &rhs, &rhs.file_to_compact_, &rhs.vset_);
+  //obprintf("this %p\n", this);
   assert_eq((void*)rhs.file_to_compact_, (void*)0);
   //assert_eq((void*)rhs.vset_, (void*)1);
   assert_eq(rhs.file_to_compact_level_, -1);
@@ -848,11 +854,11 @@ void VersionSet::AppendVersion_orbit(Version* v, orbit_scratch *scratch,
   v->next_->prev_ = v;
 
   VersionSet *vset = this;
-    fprintf(stderr, "file_to_compact_level_ %d\n", v->file_to_compact_level_);
+    obprintf("file_to_compact_level_ %d\n", v->file_to_compact_level_);
   orbit_scratch_run3(scratch, VersionSet *, vset, Version *, v, Version::obj_tracker *, tracker, {
     void dump_last_mem(void);
     dump_last_mem();
-    fprintf(stderr, "file_to_compact_level_ %p %d\n", v, v->file_to_compact_level_);
+    obprintf("file_to_compact_level_ %p %d\n", v, v->file_to_compact_level_);
     // __asm__ ("int3");
     // RK: Note that this `vnew` must have different name from `v`, otherwise
     // it will be used in the copy constructor, because it was shadowed in the
@@ -976,12 +982,12 @@ Status VersionSet::LogAndApply_orbit(VersionEdit* edit, orbit_scratch *scratch) 
 
   Version::obj_tracker *tracker = new Version::obj_tracker;
   Version* v = new Version(this);
-  fprintf(stderr, "file_to_compact_level_ %p %d\n", v, v->file_to_compact_level_);
+  obprintf("file_to_compact_level_ %p %d\n", v, v->file_to_compact_level_);
   {
     Builder builder(this, current_);
     builder.Apply(edit);
     builder.SaveTo_orbit(v, tracker);
-    fprintf(stderr, "file_to_compact_level_ %d\n", v->file_to_compact_level_);
+    obprintf("file_to_compact_level_ %d\n", v->file_to_compact_level_);
     orbit_scratch_run1(scratch, Version::obj_tracker *, tracker, {
       for (FileMetaData *f : tracker->add_ref_files) {
         f->refs++;
@@ -992,7 +998,7 @@ Status VersionSet::LogAndApply_orbit(VersionEdit* edit, orbit_scratch *scratch) 
     });
   }
   Finalize(v);
-  fprintf(stderr, "file_to_compact_level_ %d\n", v->file_to_compact_level_);
+  obprintf("file_to_compact_level_ %d\n", v->file_to_compact_level_);
 
   // Initialize new descriptor log file if necessary by creating
   // a temporary file that contains a snapshot of the current version.
@@ -1006,7 +1012,7 @@ Status VersionSet::LogAndApply_orbit(VersionEdit* edit, orbit_scratch *scratch) 
     // first call to LogAndApply (when opening the database).
     // TODO(orbit): If the above is true, then orbit prabably should never
     // hit this path.
-    fprintf(stderr, "orbit: we should not really hit this path, should we?\n");
+    obprintf("we should not really hit this path, should we?\n");
     abort();
     assert(descriptor_file_ == nullptr);
     new_manifest_file = DescriptorFileName(dbname_, manifest_file_number_);
@@ -1054,7 +1060,7 @@ Status VersionSet::LogAndApply_orbit(VersionEdit* edit, orbit_scratch *scratch) 
     prev_log_number_ = edit->prev_log_number_;
     orbit_scratch_push_update(scratch, &prev_log_number_, sizeof(prev_log_number_));
   } else {
-    fprintf(stderr, "orbit: compaction has failed!\n");
+    obprintf("compaction has failed!\n");
     delete v;
     if (!new_manifest_file.empty()) {
       delete descriptor_log_;

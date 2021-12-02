@@ -41,6 +41,12 @@
 #include "orbit.h"
 #include <limits>
 
+#if 0
+#define obprintf(fmt, ...) do { fprintf(stderr, "orbit: " fmt, ##__VA_ARGS__); } while (0)
+#else
+#define obprintf(...) do { } while (0)
+#endif
+
 static struct orbit_pool *bgc_pool = orbit_pool_create(NULL, 64 * 1024 * 1024);
 static struct orbit_pool *bgc_reply_pool = orbit_pool_create(NULL, 64 * 1024 * 1024);
 static struct orbit_pool *bgc_scratch_pool = orbit_pool_create(NULL, 64 * 1024 * 1024);
@@ -717,7 +723,7 @@ struct BGWork_orbit_args {
 void DBImpl::MaybeScheduleCompaction() {
   assert_not_orbit_context();
   // std::cerr << std::endl;
-  fprintf(stderr, "orbit: maybe schedule compaction\n");
+  obprintf("maybe schedule compaction\n");
   mutex_.AssertHeld();
   if (background_compaction_scheduled_) {
     // Already scheduled
@@ -732,8 +738,8 @@ void DBImpl::MaybeScheduleCompaction() {
     background_compaction_scheduled_ = true;
     env_->Schedule(&DBImpl::BGWork, this);
   } else {
-    fprintf(stderr, "orbit: scheduling compaction\n");
-    fprintf(stderr, "orbit: scheduling imm=%p manual=%p, score=%f, file=%p\n",
+    obprintf("scheduling compaction\n");
+    obprintf("scheduling imm=%p manual=%p, score=%f, file=%p\n",
         imm_, manual_compaction_, versions_->current_->compaction_score_,
         versions_->current_->file_to_compact_);
     background_compaction_scheduled_ = true;
@@ -747,7 +753,7 @@ void DBImpl::MaybeScheduleCompaction() {
     struct orbit_task task;
     int ret = orbit_call_async(ob_, 0, 1, &bgc_pool, NULL, &args, sizeof(args), &task);
     if (ret != 0) {
-      fprintf(stderr, "orbit: error making obcall!\n");
+      obprintf("error making obcall!\n");
       return;
     }
 
@@ -756,7 +762,7 @@ void DBImpl::MaybeScheduleCompaction() {
       env_->StartThread(DBImpl::ob_bgwait, this);
     }
     ob_bgwait_queue_->push(task);
-    fprintf(stderr, "orbit: task pushed!\n");
+    obprintf("task pushed!\n");
   }
 }
 
@@ -822,7 +828,7 @@ void DBImpl::ob_bgwait(void *db_)
   DBImpl *db = (DBImpl *)db_;
   orbit_task task;
   while (db->ob_bgwait_queue_->pop(&task, db->shutting_down_)) {
-    fprintf(stderr, "orbit: task popped!\n");
+    obprintf("task popped!\n");
 
     /* FIXME: Currently this is an ad hoc approach for LevelDB to receive
      * compaction updates. */
@@ -832,7 +838,7 @@ void DBImpl::ob_bgwait(void *db_)
     int ret;
 
     ret = orbit_recvv(&result_pool, &task);
-    fprintf(stderr, "recv %p %lu %lu\n", result_pool.scratch.ptr,
+    obprintf("recv %p %lu %lu\n", result_pool.scratch.ptr,
         result_pool.scratch.cursor, result_pool.scratch.size_limit);
     start = (char*)result_pool.scratch.ptr + result_pool.scratch.size_limit - 4096 * 1;
     end = (char*)result_pool.scratch.ptr + result_pool.scratch.size_limit - 4096 * 0;
@@ -840,19 +846,19 @@ void DBImpl::ob_bgwait(void *db_)
 
     assert_eq(ret, 1);
     ret = orbit_recvv(&result_updates, &task);
-    fprintf(stderr, "recv %p %lu %lu\n", result_updates.scratch.ptr,
+    obprintf("recv %p %lu %lu\n", result_updates.scratch.ptr,
         result_updates.scratch.cursor, result_updates.scratch.size_limit);
     dump_last_mem();
     assert_eq(ret, 1);
     ret = orbit_recvv(&result_retval, &task);
     assert_eq(ret, 0);
-    fprintf(stderr, "orbit: task received!\n");
+    obprintf("task received!\n");
 
     db->mutex_.Lock();
     orbit_type apply_res = orbit_apply(&result_updates.scratch, false);
     assert_eq(apply_res, ORBIT_END);
     db->mutex_.Unlock();
-    fprintf(stderr, "orbit: scratch applied!\n");
+    obprintf("scratch applied!\n");
   }
 }
 
@@ -894,7 +900,7 @@ void DBImpl::BackgroundCall_orbit() {
   orbit_scratch scratch;
   orbit_scratch_create(&scratch);
 
-  fprintf(stderr, "still alive 1\n");
+  obprintf("still alive 1\n");
 
   // FIXME: Do not create the alloc at the same place for the entire pool
   // every time.
@@ -904,7 +910,7 @@ void DBImpl::BackgroundCall_orbit() {
   // transparently allocate all the objects that need to be sent back to the
   // main program.
   orbit::set_global_allocator(reply_alloc);
-  fprintf(stderr, "still alive 2\n");
+  obprintf("still alive 2\n");
 
   /* ORBIT_SYNC_TAG Orbit already have a snapshot of all the states, so
    * we do not need to worry that we see inconsistent states without a lock in
@@ -943,9 +949,9 @@ void DBImpl::BackgroundCall_orbit() {
 
     void *dummy = orbit_alloc(reply_alloc, sizeof(int));
 
-    fprintf(stderr, "still alive 3\n");
+    obprintf("still alive 3\n");
     BackgroundCompaction_orbit(&scratch);
-    fprintf(stderr, "still alive 4\n");
+    obprintf("still alive 4\n");
 
     assert(pending_outputs_.size() == 0);
     // Compare with the old pointers. Apply update if it is updated.
@@ -959,7 +965,7 @@ void DBImpl::BackgroundCall_orbit() {
         });
       }
     }
-    fprintf(stderr, "still alive 5\n");
+    obprintf("still alive 5\n");
   }
 
   background_compaction_scheduled_ = false;
@@ -987,18 +993,18 @@ void DBImpl::BackgroundCall_orbit() {
     .count = 0,
     .any_alloc = nullptr,
   };
-  fprintf(stderr, "still alive 6: %p %lu %lu\n", reply_virtual_scratch.ptr,
+  obprintf("still alive 6: %p %lu %lu\n", reply_virtual_scratch.ptr,
       reply_virtual_scratch.cursor, reply_virtual_scratch.size_limit);
   int ret = orbit_sendv(&reply_virtual_scratch), err = errno;
-  fprintf(stderr, "still alive 6.1\n");
+  obprintf("still alive 6.1\n");
   if (ret != 0)
-    fprintf(stderr, "orbit_sendv reply returns error %d: %s\n", err, strerror(err));
+    obprintf("orbit_sendv reply returns error %d: %s\n", err, strerror(err));
 
-  fprintf(stderr, "still alive 7\n");
+  obprintf("still alive 7\n");
   ret = orbit_sendv(&scratch), err = errno;
-  fprintf(stderr, "still alive 7.1\n");
+  obprintf("still alive 7.1\n");
   if (ret != 0)
-    fprintf(stderr, "orbit_sendv scratch returns error %d: %s\n", err, strerror(err));
+    obprintf("orbit_sendv scratch returns error %d: %s\n", err, strerror(err));
 }
 
 void DBImpl::BackgroundCompaction_orbit(orbit_scratch *scratch) {
@@ -1268,7 +1274,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
       /* FIXME: we need a way to do multiple compactions in one run.
        * The current technical difficulty is that is that this task
        * operates in the shared disk space. */
-      fprintf(stderr, "orbit: skipped imm table compaction!\n");
+      obprintf("skipped imm table compaction!\n");
     }
 
     Slice key = input->key();
