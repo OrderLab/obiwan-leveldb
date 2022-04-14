@@ -987,9 +987,9 @@ void DBImpl::BackgroundCall_orbit() {
   // We should instead directly have a pool range send API, and that would be
   // much more flexible and ergonomic.
   orbit_scratch reply_virtual_scratch = (orbit_scratch) {
-    .ptr = reply_alloc->start,
-    .cursor = *reply_alloc->allocated,
-    .size_limit = *reply_alloc->allocated,
+    .ptr = bgc_reply_pool->data_start,
+    .cursor = bgc_reply_pool->data_length,
+    .size_limit = bgc_reply_pool->data_length,
     .count = 0,
     .any_alloc = nullptr,
   };
